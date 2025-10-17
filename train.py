@@ -118,6 +118,21 @@ def parse_arguments():
         help='Frequency (in batches) for printing training progress. Default: 100.'
     )
 
+    # Validation Settings
+    parser.add_argument(
+        '--val-dataset',
+        type=str,
+        default='lfw',
+        choices=['lfw', 'celeba'],
+        help='Validation dataset to use. Options: lfw, celeba. Default: lfw.'
+    )
+    parser.add_argument(
+        '--val-root',
+        type=str,
+        default='data/lfw/val',
+        help='Path to validation dataset root directory. Default: data/lfw/val.'
+    )
+
     parser.add_argument("--world-size", default=1, type=int, help="Number of distributed processes")
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
 
@@ -440,8 +455,13 @@ def main(params):
         save_on_master(checkpoint, last_save_path)
 
         if params.local_rank == 0:
-            # LFW Evaluation (for best model and early stopping)
-            curr_accuracy, _ = evaluate.eval(model_without_ddp, device=device)
+            # Validation Evaluation (for best model and early stopping)
+            curr_accuracy, _ = evaluate.eval(
+                model_without_ddp, 
+                device=device,
+                val_dataset=params.val_dataset,
+                val_root=params.val_root
+            )
             
             # Internal validation (for monitoring only)
             val_loader = DataLoader(
@@ -458,12 +478,12 @@ def main(params):
         if early_stopping(epoch, curr_accuracy):
             break
 
-        # Save the best model if LFW similarity improves
+        # Save the best model if validation similarity improves
         if curr_accuracy > best_accuracy:
             best_accuracy = curr_accuracy
             save_on_master(checkpoint, os.path.join(params.save_path, f'{base_filename}_best.ckpt'))
             LOGGER.info(
-                f"New best LFW similarity: {best_accuracy:.4f}."
+                f"New best {params.val_dataset.upper()} similarity: {best_accuracy:.4f}. "
                 f"Model saved to {params.save_path} with `_best` postfix."
             )
 

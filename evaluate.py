@@ -98,7 +98,17 @@ def find_best_threshold(predictions, thresholds):
     return best_threshold
 
 
-def eval(model, model_path=None, device=None, lfw_root='data/val'):
+def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val'):
+    """
+    Evaluate the model on validation dataset (LFW or CelebA).
+    
+    Args:
+        model: The model to evaluate
+        model_path: Path to model weights (optional)
+        device: Device to run evaluation on
+        val_dataset: Dataset to use for validation ('lfw' or 'celeba')
+        val_root: Root directory of validation data
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -107,40 +117,66 @@ def eval(model, model_path=None, device=None, lfw_root='data/val'):
         model.load_state_dict(state_dict)
     model.to(device).eval()
 
-    root = lfw_root
-    try:
-        with open(os.path.join(root, 'lfw_ann.txt')) as f:
-            pair_lines = f.readlines()[1:]
-    except FileNotFoundError:
-        print(f"ERRO: O arquivo de anotacao 'lfw_ann.txt' nao foi encontrado em '{root}'. Verifique o caminho.")
-        return 0.0, np.array([])
-
+    root = val_root
+    
+    # Select annotation file and image path logic based on dataset
+    if val_dataset == 'lfw':
+        ann_file = os.path.join(root, 'lfw_ann.txt')
+        try:
+            with open(ann_file) as f:
+                pair_lines = f.readlines()[1:]
+        except FileNotFoundError:
+            print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'. Check the path.")
+            return 0.0, np.array([])
+    elif val_dataset == 'celeba':
+        ann_file = os.path.join(root, 'celeba_pairs.txt')
+        try:
+            with open(ann_file) as f:
+                pair_lines = f.readlines()[1:]  # Skip header if exists
+        except FileNotFoundError:
+            print(f"ERROR: Annotation file 'celeba_pairs.txt' not found in '{root}'. Check the path.")
+            return 0.0, np.array([])
+    else:
+        raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw' or 'celeba'.")
 
     predicts = []
     with torch.no_grad():
         for line in pair_lines:
             parts = line.strip().split()
 
-            if len(parts) == 3:
-                person_name, img_num1, img_num2 = parts[0], parts[1], parts[2]
-                
-                # Formata o nome do arquivo como: "Nome_Pessoa_0001.jpg"
-                filename1 = f'{person_name}_{int(img_num1):04d}.jpg'
-                filename2 = f'{person_name}_{int(img_num2):04d}.jpg'
-                
-                # Monta o caminho completo
-                path1 = os.path.join(root, person_name, filename1)
-                path2 = os.path.join(root, person_name, filename2)
-                is_same = '1'
-            else:
-                # Ignora linhas que nao tenham 3 colunas
-                continue
+            if val_dataset == 'lfw':
+                if len(parts) == 3:
+                    person_name, img_num1, img_num2 = parts[0], parts[1], parts[2]
+                    
+                    # Format filename as: "Person_Name_0001.jpg"
+                    filename1 = f'{person_name}_{int(img_num1):04d}.jpg'
+                    filename2 = f'{person_name}_{int(img_num2):04d}.jpg'
+                    
+                    # Build full path
+                    path1 = os.path.join(root, person_name, filename1)
+                    path2 = os.path.join(root, person_name, filename2)
+                    is_same = '1'
+                else:
+                    # Skip lines that don't have 3 columns
+                    continue
+                    
+            elif val_dataset == 'celeba':
+                if len(parts) == 2:
+                    # Format: img1.jpg img2.jpg (both same identity - positive pairs only)
+                    filename1, filename2 = parts[0], parts[1]
+                    
+                    # CelebA images are in img_align_celeba/img_align_celeba folder
+                    path1 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', filename1)
+                    path2 = os.path.join(root, 'img_align_celeba', 'img_align_celeba', filename2)
+                    is_same = '1'
+                else:
+                    continue
 
             try:
                 img1 = Image.open(path1).convert('RGB')
                 img2 = Image.open(path2).convert('RGB')
             except FileNotFoundError:
-                print(f"Alerta: Imagem nao encontrada, pulando o par: {path1} ou {path2}")
+                print(f"Warning: Image not found, skipping pair: {path1} or {path2}")
                 continue
 
             f1 = extract_deep_features(model, img1, device)
@@ -150,7 +186,7 @@ def eval(model, model_path=None, device=None, lfw_root='data/val'):
             predicts.append([path1, path2, distance.item(), is_same])
     
     if len(predicts) == 0:
-        print("Alerta: Nenhum par valido foi processado na avaliacao.")
+        print("Warning: No valid pairs were processed in the evaluation.")
         return 0.0, np.array([])
 
     predicts = np.array(predicts)
@@ -158,8 +194,9 @@ def eval(model, model_path=None, device=None, lfw_root='data/val'):
     mean_similarity = np.mean(similarities)
     std_similarity = np.std(similarities)
 
-    print(f'LFW - Avaliacao Simplificada (Somente Pares Positivos):')
-    print(f'Similaridade Media: {mean_similarity:.4f} | Desvio Padrao: {std_similarity:.4f}')
+    dataset_name = val_dataset.upper()
+    print(f'{dataset_name} - Simplified Evaluation (Positive Pairs Only):')
+    print(f'Mean Similarity: {mean_similarity:.4f} | Standard Deviation: {std_similarity:.4f}')
 
     accuracy_proxy = mean_similarity 
     
