@@ -455,13 +455,20 @@ def main(params):
         save_on_master(checkpoint, last_save_path)
 
         if params.local_rank == 0:
-            # Validation Evaluation (for best model and early stopping)
-            curr_accuracy, _ = evaluate.eval(
+            # Validation Evaluation with new metrics
+            curr_accuracy, predictions, metrics = evaluate.eval(
                 model_without_ddp, 
                 device=device,
                 val_dataset=params.val_dataset,
                 val_root=params.val_root
             )
+            
+            # Log the new metrics (TAR, FAR, FRR)
+            LOGGER.info(f'Validation Metrics at Epoch {epoch+1}:')
+            LOGGER.info(f'  Similarity: {curr_accuracy:.4f}')
+            LOGGER.info(f'  TAR (True Acceptance Rate): {metrics["TAR"]:.4f}')
+            LOGGER.info(f'  FAR (False Acceptance Rate): {metrics["FAR"]:.4f}')
+            LOGGER.info(f'  FRR (False Rejection Rate): {metrics["FRR"]:.4f}')
             
             # Internal validation (for monitoring only)
             val_loader = DataLoader(
@@ -473,7 +480,7 @@ def main(params):
             )
             
             val_accuracy = validate_model(model_without_ddp, classification_head, val_loader, device)
-            LOGGER.info(f'Validation accuracy ({params.database} subset): {val_accuracy:.4f}')
+            LOGGER.info(f'Internal validation accuracy ({params.database} subset): {val_accuracy:.4f}')
 
         if early_stopping(epoch, curr_accuracy):
             break

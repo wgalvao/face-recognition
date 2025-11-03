@@ -31,13 +31,13 @@ def extract_deep_features(model, image, device):
 
     # Define transforms
     original_transform = transforms.Compose([
-	transforms.Resize((112, 112)),
+        transforms.Resize((112, 112)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
 
     flipped_transform = transforms.Compose([
-	transforms.Resize((112, 112)),
+        transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(p=1.0),  # Always flip
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
@@ -70,6 +70,16 @@ def k_fold_split(n=6000, n_folds=10):
 
 
 def eval_accuracy(predictions, threshold):
+    """
+    Calculate accuracy based on predictions and threshold.
+    
+    Args:
+        predictions: Array with [path1, path2, distance, gt]
+        threshold: Similarity threshold for positive match
+        
+    Returns:
+        accuracy: Classification accuracy
+    """
     y_true = []
     y_pred = []
 
@@ -85,17 +95,95 @@ def eval_accuracy(predictions, threshold):
     return accuracy
 
 
-def find_best_threshold(predictions, thresholds):
-    best_accuracy = 0
-    best_threshold = 0
+def calculate_tar_far_frr(predictions, threshold):
+    """
+    Calculate TAR (True Acceptance Rate), FAR (False Acceptance Rate), 
+    and FRR (False Rejection Rate) at a given threshold.
+    
+    Based on standard biometric evaluation metrics:
+    - TAR = True Positives / (True Positives + False Negatives) = 1 - FRR
+    - FAR = False Positives / (False Positives + True Negatives)
+    - FRR = False Negatives / (False Negatives + True Positives) = 1 - TAR
+    
+    Args:
+        predictions: Array with [path1, path2, similarity, ground_truth]
+                    ground_truth: '1' for same person, '0' for different
+        threshold: Similarity threshold for classification
+        
+    Returns:
+        dict with 'TAR', 'FAR', 'FRR' values
+    """
+    # Extract similarities and ground truth
+    similarities = predictions[:, 2].astype(float)
+    ground_truth = predictions[:, 3].astype(int)
+    
+    # Predictions based on threshold
+    predictions_binary = (similarities > threshold).astype(int)
+    
+    # Calculate confusion matrix components
+    # Genuine pairs (same person, gt=1)
+    genuine_mask = (ground_truth == 1)
+    genuine_accepted = np.sum((predictions_binary == 1) & genuine_mask)  # True Positives
+    genuine_rejected = np.sum((predictions_binary == 0) & genuine_mask)  # False Negatives
+    
+    # Impostor pairs (different person, gt=0)
+    impostor_mask = (ground_truth == 0)
+    impostor_accepted = np.sum((predictions_binary == 1) & impostor_mask)  # False Positives
+    impostor_rejected = np.sum((predictions_binary == 0) & impostor_mask)  # True Negatives
+    
+    # Calculate metrics
+    # TAR (True Acceptance Rate) = TP / (TP + FN)
+    total_genuine = genuine_accepted + genuine_rejected
+    TAR = genuine_accepted / total_genuine if total_genuine > 0 else 0.0
+    
+    # FAR (False Acceptance Rate) = FP / (FP + TN)
+    total_impostor = impostor_accepted + impostor_rejected
+    FAR = impostor_accepted / total_impostor if total_impostor > 0 else 0.0
+    
+    # FRR (False Rejection Rate) = FN / (FN + TP) = 1 - TAR
+    FRR = genuine_rejected / total_genuine if total_genuine > 0 else 0.0
+    
+    return {
+        'TAR': TAR,
+        'FAR': FAR,
+        'FRR': FRR,
+        'threshold': threshold
+    }
 
+
+def find_best_threshold(predictions, thresholds=None):
+    """
+    Find the best threshold by minimizing Equal Error Rate (EER).
+    EER is the point where FAR = FRR.
+    
+    Args:
+        predictions: Array with predictions
+        thresholds: List of thresholds to test (optional)
+        
+    Returns:
+        best_threshold: Threshold with minimum EER
+        best_metrics: Metrics at best threshold
+    """
+    if thresholds is None:
+        # Generate thresholds based on similarity distribution
+        similarities = predictions[:, 2].astype(float)
+        thresholds = np.linspace(similarities.min(), similarities.max(), 100)
+    
+    best_eer = float('inf')
+    best_threshold = 0.35
+    best_metrics = None
+    
     for threshold in thresholds:
-        accuracy = eval_accuracy(predictions, threshold)
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
+        metrics = calculate_tar_far_frr(predictions, threshold)
+        # EER is where FAR ≈ FRR
+        eer = abs(metrics['FAR'] - metrics['FRR'])
+        
+        if eer < best_eer:
+            best_eer = eer
             best_threshold = threshold
-
-    return best_threshold
+            best_metrics = metrics
+    
+    return best_threshold, best_metrics
 
 
 def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val'):
@@ -108,6 +196,11 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         device: Device to run evaluation on
         val_dataset: Dataset to use for validation ('lfw' or 'celeba')
         val_root: Root directory of validation data
+        
+    Returns:
+        similarity_score: Average similarity score
+        predictions: Array with all predictions
+        metrics: Dict with TAR, FAR, FRR at default threshold (0.35)
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -127,7 +220,7 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
                 pair_lines = f.readlines()[1:]
         except FileNotFoundError:
             print(f"ERROR: Annotation file 'lfw_ann.txt' not found in '{root}'. Check the path.")
-            return 0.0, np.array([])
+            return 0.0, np.array([]), {}
     elif val_dataset == 'celeba':
         ann_file = os.path.join(root, 'celeba_pairs.txt')
         try:
@@ -135,7 +228,7 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
                 pair_lines = f.readlines()[1:]  # Skip header if exists
         except FileNotFoundError:
             print(f"ERROR: Annotation file 'celeba_pairs.txt' not found in '{root}'. Check the path.")
-            return 0.0, np.array([])
+            return 0.0, np.array([]), {}
     else:
         raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw' or 'celeba'.")
 
@@ -187,7 +280,7 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
     
     if len(predicts) == 0:
         print("Warning: No valid pairs were processed in the evaluation.")
-        return 0.0, np.array([])
+        return 0.0, np.array([]), {}
 
     predicts = np.array(predicts)
     similarities = predicts[:, 2].astype(float)
@@ -198,14 +291,24 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
     print(f'{dataset_name} - Simplified Evaluation (Positive Pairs Only):')
     print(f'Mean Similarity: {mean_similarity:.4f} | Standard Deviation: {std_similarity:.4f}')
 
+    # Calculate TAR, FAR, FRR at default threshold (0.35)
+    default_threshold = 0.35
+    metrics = calculate_tar_far_frr(predicts, default_threshold)
+    
+    print(f'\nMetrics at threshold {default_threshold}:')
+    print(f'TAR (True Acceptance Rate): {metrics["TAR"]:.4f}')
+    print(f'FAR (False Acceptance Rate): {metrics["FAR"]:.4f}')
+    print(f'FRR (False Rejection Rate): {metrics["FRR"]:.4f}')
+    
     accuracy_proxy = mean_similarity 
     
-    return accuracy_proxy, predicts
+    return accuracy_proxy, predicts, metrics
+
 
 if __name__ == '__main__':
-    _, result = eval(sphere20(512).to('cuda'), model_path='weights/sphere20_mcp.pth')
-    _, result = eval(sphere36(512).to('cuda'), model_path='weights/sphere36_mcp.pth')
-    _, result = eval(MobileNetV1(512).to('cuda'), model_path='weights/mobilenetv1_mcp.pth')
-    _, result = eval(MobileNetV2(512).to('cuda'), model_path='weights/mobilenetv2_mcp.pth')
-    _, result = eval(mobilenet_v3_small(512).to('cuda'), model_path='weights/mobilenetv3_small_mcp.pth')
-    _, result = eval(mobilenet_v3_large(512).to('cuda'), model_path='weights/mobilenetv3_large_mcp.pth')
+    _, result, _ = eval(sphere20(512).to('cuda'), model_path='weights/sphere20_mcp.pth')
+    _, result, _ = eval(sphere36(512).to('cuda'), model_path='weights/sphere36_mcp.pth')
+    _, result, _ = eval(MobileNetV1(512).to('cuda'), model_path='weights/mobilenetv1_mcp.pth')
+    _, result, _ = eval(MobileNetV2(512).to('cuda'), model_path='weights/mobilenetv2_mcp.pth')
+    _, result, _ = eval(mobilenet_v3_small(512).to('cuda'), model_path='weights/mobilenetv3_small_mcp.pth')
+    _, result, _ = eval(mobilenet_v3_large(512).to('cuda'), model_path='weights/mobilenetv3_large_mcp.pth')
