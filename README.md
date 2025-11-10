@@ -2,10 +2,6 @@
 
 Framework de treinamento para reconhecimento facial baseado em CNNs com suporte a múltiplas arquiteturas e loss functions.
 
-## Visão Geral
-
-Este projeto implementa um pipeline completo para treinamento e avaliação de modelos de reconhecimento facial. Suporta diferentes arquiteturas de redes neurais e métodos de loss baseados em margem angular para aprendizado de embeddings discriminativos.
-
 ## 🆕 Novas Funcionalidades (v2.0)
 
 ### Sistema de Tracking Automático de Treinamento
@@ -241,7 +237,7 @@ O script avalia os modelos treinados e calcula **todas as métricas** incluindo 
 
 O notebook `1.Notebooks/Eval.ipynb` foi atualizado com novas células para:
 
-- Calcular todas as 12+ métricas automaticamente
+- Calcular todas as métricas automaticamente
 - Visualizar ROC Curve
 - Visualizar Confusion Matrix
 - Analisar sensibilidade ao threshold
@@ -471,26 +467,6 @@ python -m torch.distributed.launch \
 - Comparação lado-a-lado de todas as métricas
 - 6 gráficos individuais
 
-### Usando o Histórico JSON
-
-```python
-import json
-
-# Carregar histórico
-history = json.load(open('weights/final_report/training_history.json'))
-
-# Acessar métricas
-epochs = history['epochs']
-train_loss = history['train_loss']
-external_auc = history['external_auc']
-f1_scores = history['external_f1']
-
-# Plotar custom
-import matplotlib.pyplot as plt
-plt.plot(epochs, external_auc)
-plt.show()
-```
-
 ## Licença
 
 Este projeto é fornecido para fins educacionais e de pesquisa.
@@ -501,21 +477,9 @@ Este projeto é fornecido para fins educacionais e de pesquisa.
 
 **Adicionado:**
 - Sistema TrainingTracker para rastreamento automático de métricas
-- 12+ novas métricas de avaliação (F1, Precision, Recall, AUC, TAR, FAR, FRR)
+- Novas métricas de avaliação (F1, Precision, Recall, AUC, TAR, FAR, FRR)
 - Visualizações automáticas (4 tipos de plots profissionais)
 - Relatório final completo com todas as métricas
 - Histórico preservado em checkpoints
 - ROC Curves automáticas
 - Confusion Matrix com evolução
-- Learning Rate schedule visualization
-
-**Modificado:**
-- `train.py` - Integração com TrainingTracker
-- `evaluate.py` - Métricas expandidas com visualizações
-- `Eval.ipynb` - 7 novas células com análises completas
-- `requirements.txt` - Novas dependências (scikit-learn, matplotlib, seaborn, pandas)
-
-**Comportamento:**
-- Plots agora são **sempre** salvos automaticamente (sem necessidade de flags)
-- Todas as métricas são calculadas automaticamente a cada época
-- Relatório final é gerado automaticamente ao término do treinamento
