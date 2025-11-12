@@ -32,15 +32,6 @@ from models import (
 
 from utils.validation_split import create_validation_split
 
-# Import face validation (optional, will warn if not available)
-try:
-    from utils.face_validation import FaceValidator, print_validation_summary
-    FACE_VALIDATION_AVAILABLE = True
-except ImportError:
-    FACE_VALIDATION_AVAILABLE = False
-    LOGGER.warning("Face validation module not available. RetinaFace validation will be disabled.")
-
-
 def parse_arguments():
     parser = argparse.ArgumentParser(description=("Command-line arguments for training a face recognition model"))
 
@@ -82,8 +73,6 @@ def parse_arguments():
     parser.add_argument('--batch-size', type=int, default=512, help='Batch size for training. Default: 512.')
     parser.add_argument('--epochs', type=int, default=30, help='Number of epochs for training. Default: 30.')
     parser.add_argument('--lr', type=float, default=0.1, help='Initial learning rate. Default: 0.1.')
-    
-    # lr_scheduler configuration
     parser.add_argument(
         '--lr-scheduler',
         type=str,
@@ -120,7 +109,6 @@ def parse_arguments():
     )
     parser.add_argument('--num-workers', type=int, default=8, help='Number of data loader workers. Default: 8.')
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint to continue training.")
-
     parser.add_argument(
         '--print-freq',
         type=int,
@@ -149,35 +137,8 @@ def parse_arguments():
         help='Similarity threshold for validation metrics. Default: 0.35.'
     )
 
-    # 🆕 FACE VALIDATION SETTINGS (RetinaFace)
-    parser.add_argument(
-        '--use-retinaface-validation',
-        action='store_true',
-        help='Enable face validation using RetinaFace during validation. Images without detected faces will be handled according to --no-face-policy.'
-    )
-    parser.add_argument(
-        '--no-face-policy',
-        type=str,
-        default='exclude',
-        choices=['exclude', 'include'],
-        help='Policy for handling images without detected faces. "exclude": skip them during validation (default). "include": use them anyway.'
-    )
-    parser.add_argument(
-        '--retinaface-conf-threshold',
-        type=float,
-        default=0.5,
-        help='Confidence threshold for RetinaFace face detection. Default: 0.5.'
-    )
-    parser.add_argument(
-        '--face-validation-cache-dir',
-        type=str,
-        default='face_validation_cache',
-        help='Directory to store face validation cache files. Default: face_validation_cache.'
-    )
-
     parser.add_argument("--world-size", default=1, type=int, help="Number of distributed processes")
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
-
     parser.add_argument(
         "--use-deterministic-algorithms",
         action="store_true",
@@ -204,7 +165,7 @@ def validate_model(model, classification_head, val_loader, device):
             if isinstance(classification_head, torch.nn.Linear):
                 outputs = classification_head(embeddings)
             else:
-                outputs = classification_head(embeddings, targets)
+                outputs, _ = classification_head(embeddings, targets)
             
             _, predicted = torch.max(outputs.data, 1)
             total_samples += targets.size(0)
@@ -212,14 +173,12 @@ def validate_model(model, classification_head, val_loader, device):
     
     accuracy = total_correct / total_samples
     
-    # Return to training mode
     model.train()
     classification_head.train()
     
     return accuracy
 
 
-# Define a function to select a classification head
 def get_classification_head(classifier, embedding_dim, num_classes):
     classifiers = {
         'MCP': MarginCosineProduct(embedding_dim, num_classes),
@@ -236,7 +195,8 @@ def get_classification_head(classifier, embedding_dim, num_classes):
 def train_one_epoch(
     model,
     classification_head,
-    criterion, optimizer,
+    criterion, 
+    optimizer,
     data_loader,
     device,
     epoch,
@@ -252,127 +212,131 @@ def train_one_epoch(
     for batch_idx, (images, target) in enumerate(data_loader):
         last_batch = last_batch_idx == batch_idx
 
-        # Move data to device
         images = images.to(device)
         target = target.to(device)
 
-        # Reset gradients
         optimizer.zero_grad()
 
-        # Forward pass
         embeddings = model(images)
+        
         if isinstance(classification_head, torch.nn.Linear):
             output = classification_head(embeddings)
+            cosine_output = output
         else:
-            output = classification_head(embeddings, target)
+            output_with_margin, cosine_output = classification_head(embeddings, target)
+            output = output_with_margin
 
-        # Compute loss and accuracy
         loss = criterion(output, target)
+        accuracy = calculate_accuracy(cosine_output, target)
 
-        # calculate_accuracy is a function to compute classification accuracy.
-        accuracy = calculate_accuracy(output, target)
+        if args.distributed:
+            reduced_loss = reduce_tensor(loss, args.world_size)
+            accuracy = reduce_tensor(accuracy, args.world_size)
+        else:
+            reduced_loss = loss
 
-        # Backward pass
         loss.backward()
         optimizer.step()
 
-        # Update meters
-        if params.distributed:
-            reduced_loss = reduce_tensor(loss.data, params.world_size)
-            losses.update(reduced_loss.item(), images.size(0))
-        else:
-            losses.update(loss.item(), images.size(0))
-
+        losses.update(reduced_loss.item(), images.size(0))
         accuracy_meter.update(accuracy.item(), images.size(0))
-
-        # Update time
         batch_time.update(time.time() - start_time)
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+
         start_time = time.time()
 
-        # Print progress
         if batch_idx % params.print_freq == 0 or last_batch:
-            if params.local_rank == 0:
-                LOGGER.info(
-                    f"Epoch [{epoch+1}/{params.epochs}][{batch_idx}/{last_batch_idx}] "
-                    f"Loss: {losses.val:.4f} ({losses.avg:.4f}) "
-                    f"Acc: {accuracy_meter.val:.4f} ({accuracy_meter.avg:.4f}) "
-                    f"Time: {batch_time.val:.3f}s"
-                )
+            lr = optimizer.param_groups[0]['lr']
+            log = (
+                f'Epoch: [{epoch+1}/{params.epochs}][{batch_idx:05d}/{len(data_loader):05d}] '
+                f'Loss: {losses.avg:6.3f}, '
+                f'Accuracy: {accuracy_meter.avg:4.2f}%, '
+                f'LR: {lr:.5f} '
+                f'Time: {batch_time.avg:4.3f}s'
+            )
+            LOGGER.info(log)
+
+    log = (
+        f'Epoch [{epoch}/{params.epochs}] Summary: '
+        f'Loss: {losses.avg:6.3f}, '
+        f'Accuracy: {accuracy_meter.avg:4.2f}%, '
+        f'Total Time: {batch_time.sum:4.3f}s'
+    )
+    LOGGER.info(log)
 
 
-def main(args):
-    params = args
-
-    # Setup for distributed training
+def main(params):
     init_distributed_mode(params)
-    device = torch.device(params.device if hasattr(params, 'device') else 'cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Seed for reproducibility
-    setup_seed(42)
+    setup_seed()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Database configuration
+    if params.use_deterministic_algorithms:
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.benchmark = True
+
     db_config = {
         'WebFace': {'num_classes': 10572},
         'VggFace2': {'num_classes': 8631},
         'MS1M': {'num_classes': 85742},
         'VggFaceHQ': {'num_classes': 9131}
     }
+    
+    if params.database not in db_config:
+        raise ValueError("Unsupported database!")
 
-    LOGGER.info(f'Training on database: {params.database}')
     num_classes = db_config[params.database]['num_classes']
 
-    # Model selection based on arguments
-    if params.network == 'sphere20':
-        model = sphere20(embedding_dim=512, in_channels=3)
-    elif params.network == 'sphere36':
-        model = sphere36(embedding_dim=512, in_channels=3)
-    elif params.network == 'sphere64':
-        model = sphere64(embedding_dim=512, in_channels=3)
-    elif params.network == "mobilenetv1":
-        model = MobileNetV1(embedding_dim=512)
-    elif params.network == "mobilenetv2":
-        model = MobileNetV2(embedding_dim=512)
-    elif params.network == "mobilenetv3_small":
-        model = mobilenet_v3_small(embedding_dim=512)
-    elif params.network == "mobilenetv3_large":
-        model = mobilenet_v3_large(embedding_dim=512)
-    else:
-        raise ValueError("Unsupported network!")
+    LOGGER.info(f'Training on database: {params.database}')
 
-    # No need for DataParallel, we are using a single GPU
-    model = model.to(device)
+    networks = {
+        'sphere20': sphere20,
+        'sphere36': sphere36,
+        'sphere64': sphere64,
+        'mobilenetv1': MobileNetV1,
+        'mobilenetv2': MobileNetV2,
+        'mobilenetv3_small': mobilenet_v3_small,
+        'mobilenetv3_large': mobilenet_v3_large
+    }
 
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+    if params.network not in networks:
+        raise ValueError(f"Unsupported network: {params.network}")
+
+    model = networks[params.network](embedding_dim=512)
+    model.to(device)
+
+    classification_head = get_classification_head(params.classifier, 512, num_classes)
+    classification_head.to(device)
+
+    if params.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[params.local_rank], output_device=params.local_rank
+        )
+        classification_head = torch.nn.parallel.DistributedDataParallel(
+            classification_head, device_ids=[params.local_rank], output_device=params.local_rank
+        )
         model_without_ddp = model.module
+    else:
+        model_without_ddp = model
 
-    # Create save path if it does not exist
     os.makedirs(params.save_path, exist_ok=True)
-    
-    # Create metrics save path
     metrics_save_path = os.path.join(params.save_path, 'metrics')
     os.makedirs(metrics_save_path, exist_ok=True)
 
-    # Select classification head
-    classification_head = get_classification_head(params.classifier, embedding_dim=512, num_classes=num_classes)
-    classification_head = classification_head.to(device)
-
-    # Transformations for images
+    LOGGER.info('Loading training data.')
+    
     train_transform = transforms.Compose([
-        transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(),
+        transforms.Resize((112, 112)),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=(0.5, 0.5, 0.5),
-            std=(0.5, 0.5, 0.5)
-        )
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
 
-    # DataLoader with validation split
-    LOGGER.info('Loading training data.')
     full_dataset = ImageFolder(root=params.root, transform=train_transform)
-
     train_dataset, val_dataset = create_validation_split(full_dataset, val_split=0.1)
 
     val_transform = transforms.Compose([
@@ -400,33 +364,6 @@ def main(args):
 
     LOGGER.info(f'Length of training dataset: {len(train_loader.dataset)}, Number of Identities: {num_classes}')
 
-    # 🆕 INITIALIZE FACE VALIDATOR (if enabled)
-    face_validator = None
-    if params.use_retinaface_validation:
-        if not FACE_VALIDATION_AVAILABLE:
-            LOGGER.error("❌ RetinaFace validation requested but face_validation module is not available!")
-            LOGGER.error("Please ensure utils/face_validation.py exists and uniface is installed.")
-            raise ImportError("Face validation module required but not available")
-        
-        LOGGER.info("\n" + "="*70)
-        LOGGER.info("🔍 RETINAFACE FACE VALIDATION ENABLED")
-        LOGGER.info("="*70)
-        LOGGER.info(f"Confidence threshold: {params.retinaface_conf_threshold}")
-        LOGGER.info(f"No-face policy: {params.no_face_policy}")
-        LOGGER.info(f"Cache directory: {params.face_validation_cache_dir}")
-        
-        try:
-            face_validator = FaceValidator(
-                gpu_id=0 if torch.cuda.is_available() else -1,
-                conf_threshold=params.retinaface_conf_threshold,
-                cache_dir=params.face_validation_cache_dir
-            )
-            LOGGER.info("✅ FaceValidator initialized successfully\n")
-        except Exception as e:
-            LOGGER.error(f"❌ Failed to initialize FaceValidator: {e}")
-            raise
-
-    # Loss and optimizer
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD([
         {'params': model.parameters()},
@@ -436,52 +373,54 @@ def main(args):
         momentum=params.momentum,
         weight_decay=params.weight_decay
     )
-    
-    # Learning rate scheduler
+
     if params.lr_scheduler == 'MultiStepLR':
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=params.milestones, gamma=params.gamma)
     elif params.lr_scheduler == 'StepLR':
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=params.step_size, gamma=params.gamma)
     else:
-        raise ValueError(f"Unsupported lr_scheduler: {params.lr_scheduler}")
+        raise ValueError(f"Unsupported lr_scheduler type: {params.lr_scheduler}")
 
-    # Early stopping
-    early_stopping = EarlyStopping(patience=10, verbose=True)
-
-    # Resume training if checkpoint is provided
     start_epoch = 0
-    best_accuracy = 0.0
-
     if params.checkpoint and os.path.isfile(params.checkpoint):
-        checkpoint = torch.load(params.checkpoint, map_location=device)
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-        start_epoch = checkpoint['epoch']
-        LOGGER.info(f'Resuming training from epoch {start_epoch}')
-    else:
-        LOGGER.info('Starting training from scratch')
+        ckpt = torch.load(params.checkpoint, map_location="cpu")
 
-    # Training loop
-    base_filename = f'{params.network}_{params.classifier}'
-    
+        model_without_ddp.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
+        start_epoch = ckpt['epoch']
+        LOGGER.info(f'Resumed training from {params.checkpoint}, starting at epoch {start_epoch}')
+
+    best_accuracy = 0.0
+    curr_accuracy = 0.0
+    early_stopping = EarlyStopping(patience=10)
+
+    LOGGER.info(f'Training started for {params.network}, Classifier: {params.classifier}')
     for epoch in range(start_epoch, params.epochs):
-        if params.distributed:
+        if args.distributed:
             train_sampler.set_epoch(epoch)
-
-        # Train for one epoch
         train_one_epoch(
-            model, classification_head, criterion, optimizer,
-            train_loader, device, epoch, params
+            model,
+            classification_head,
+            criterion,
+            optimizer,
+            train_loader,
+            device,
+            epoch,
+            params
         )
-
-        # Step the learning rate scheduler
         lr_scheduler.step()
 
-        # Prepare checkpoint
+        base_filename = f'{params.network}_{params.classifier}'
+
         last_save_path = os.path.join(params.save_path, f'{base_filename}_last.ckpt')
 
-        # Save the last checkpoint
         checkpoint = {
             'epoch': epoch + 1,
             'model': model_without_ddp.state_dict(),
@@ -493,16 +432,13 @@ def main(args):
         save_on_master(checkpoint, last_save_path)
 
         if params.local_rank == 0:
-            # Validation Evaluation with metrics
             LOGGER.info(f'\n{"="*70}')
             LOGGER.info(f'EPOCH {epoch+1} VALIDATION METRICS')
             LOGGER.info(f'{"="*70}')
             
-            # Salvar métricas por época
-            epoch_metrics_path = os.path.join(metrics_save_path, f'epoch_{epoch+1:03d}')
+            epoch_metrics_path = os.path.join(metrics_save_path, f'epoch_{epoch+1}')
             os.makedirs(epoch_metrics_path, exist_ok=True)
             
-            # 🆕 Pass face_validator to evaluate.eval
             curr_accuracy, _, metrics = evaluate.eval(
                 model_without_ddp, 
                 device=device,
@@ -510,12 +446,9 @@ def main(args):
                 val_root=params.val_root,
                 compute_full_metrics=True,
                 save_metrics_path=epoch_metrics_path,
-                threshold=params.val_threshold,
-                face_validator=face_validator,  # 🆕 NEW PARAMETER
-                no_face_policy=params.no_face_policy  # 🆕 NEW PARAMETER
+                threshold=params.val_threshold
             )
             
-            # Log das métricas principais
             LOGGER.info(f'\nValidation Metrics (Threshold={params.val_threshold}):')
             LOGGER.info(f'  Precision: {metrics["precision"]:.4f}')
             LOGGER.info(f'  Recall:    {metrics["recall"]:.4f}')
@@ -532,26 +465,8 @@ def main(args):
                 LOGGER.info(f'  FAR (False Accept Rate):  {metrics["far"]:.4f}')
                 LOGGER.info(f'  FRR (False Reject Rate):  {metrics["frr"]:.4f}')
             
-            # 🆕 Log face validation statistics if available
-            if 'face_validation_stats' in metrics:
-                face_stats = metrics['face_validation_stats']
-                LOGGER.info(f'\n{"="*70}')
-                LOGGER.info('FACE DETECTION STATISTICS (RetinaFace)')
-                LOGGER.info(f'{"="*70}')
-                LOGGER.info(f'  Policy: {params.no_face_policy.upper()}')
-                LOGGER.info(f'  Total pairs checked:     {face_stats.get("total_pairs", 0)}')
-                LOGGER.info(f'  Valid pairs used:        {face_stats.get("valid_pairs", 0)}')
-                LOGGER.info(f'  Excluded pairs:          {face_stats.get("excluded_pairs", 0)}')
-                if face_stats.get('total_pairs', 0) > 0:
-                    exclusion_rate = face_stats.get('excluded_pairs', 0) / face_stats.get('total_pairs', 1) * 100
-                    LOGGER.info(f'  Exclusion rate:          {exclusion_rate:.2f}%')
-                
-                if face_stats.get('excluded_pairs', 0) > 0:
-                    LOGGER.warning(f'  ⚠️  {face_stats["excluded_pairs"]} pairs excluded due to missing face detection')
-            
             LOGGER.info(f'{"="*70}\n')
             
-            # Internal validation (for monitoring only)
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=params.batch_size,
@@ -566,7 +481,6 @@ def main(args):
         if early_stopping(epoch, curr_accuracy):
             break
 
-        # Save the best model if validation similarity improves
         if curr_accuracy > best_accuracy:
             best_accuracy = curr_accuracy
             save_on_master(checkpoint, os.path.join(params.save_path, f'{base_filename}_best.ckpt'))
@@ -575,17 +489,14 @@ def main(args):
                 f"Model saved to {params.save_path} with `_best` postfix.\n"
             )
 
-    # Final comprehensive evaluation after training
     if params.local_rank == 0:
         LOGGER.info(f'\n{"="*70}')
         LOGGER.info('FINAL COMPREHENSIVE EVALUATION')
         LOGGER.info(f'{"="*70}')
         
-        # Criar diretório para métricas finais
         final_metrics_path = os.path.join(metrics_save_path, 'final_evaluation')
         os.makedirs(final_metrics_path, exist_ok=True)
         
-        # 🆕 Pass face_validator to final evaluation
         _, _, final_metrics = evaluate.eval(
             model_without_ddp,
             device=device,
@@ -593,9 +504,7 @@ def main(args):
             val_root=params.val_root,
             compute_full_metrics=True,
             save_metrics_path=final_metrics_path,
-            threshold=params.val_threshold,
-            face_validator=face_validator,  # 🆕 NEW PARAMETER
-            no_face_policy=params.no_face_policy  # 🆕 NEW PARAMETER
+            threshold=params.val_threshold
         )
         
         LOGGER.info(f'\nFinal Validation Metrics:')
@@ -610,7 +519,6 @@ def main(args):
             LOGGER.info(f'  AUC:             {final_metrics["auc"]:.4f}')
             LOGGER.info(f'  EER:             {final_metrics["eer"]:.4f} (threshold: {final_metrics["eer_threshold"]:.4f})')
             
-            # TAR@FAR metrics
             for key in final_metrics:
                 if key.startswith('TAR@FAR'):
                     far_value = key.split('=')[1]
@@ -625,24 +533,10 @@ def main(args):
             LOGGER.info(f'\n  FAR (False Accept Rate): {final_metrics["far"]:.4f}')
             LOGGER.info(f'  FRR (False Reject Rate): {final_metrics["frr"]:.4f}')
         
-        # 🆕 Save face validation report to final_report if validator was used
-        if face_validator is not None and 'face_validation_stats' in final_metrics:
-            face_report_path = os.path.join(final_metrics_path, 'face_validation_report.json')
-            face_validator.save_validation_report(
-                output_path=face_report_path,
-                dataset_name=f"{params.val_dataset.upper()}_final"
-            )
-            LOGGER.info(f'\n📊 Face validation report saved to: {face_report_path}')
-            
-            # Print final summary
-            print_validation_summary(face_validator)
-        
         LOGGER.info(f'\n{"="*70}')
         LOGGER.info(f'Metrics saved to: {final_metrics_path}')
         LOGGER.info(f'  - ROC Curve: {params.val_dataset}_roc_curve.png')
         LOGGER.info(f'  - Confusion Matrix: {params.val_dataset}_confusion_matrix.png')
-        if face_validator is not None:
-            LOGGER.info(f'  - Face Validation Report: face_validation_report.json')
         LOGGER.info(f'{"="*70}\n')
 
     LOGGER.info('Training completed.')

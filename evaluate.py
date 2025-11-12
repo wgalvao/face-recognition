@@ -27,42 +27,58 @@ except ImportError:
 
 def extract_deep_features(model, image, device):
     """
-    Extracts deep features for an image using the model, including both the original and flipped versions.
-
-    Args:
-        model (torch.nn.Module): The pre-trained deep learning model used for feature extraction.
-        image (PIL.Image): The input image to extract features from.
-        device (torch.device): The device (CPU or GPU) on which the computation will be performed.
-
-    Returns:
-        torch.Tensor: Combined feature vector of original and flipped images.
+    Extrai características profundas de uma imagem usando o modelo fornecido.
     """
-
-    # Define transforms
-    original_transform = transforms.Compose([
+    transform = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
+    
+    image_tensor = transform(image).unsqueeze(0).to(device)
+    features = model(image_tensor).squeeze()
+    
+    return features
 
-    flipped_transform = transforms.Compose([
+
+def extract_deep_features_batch(model, images, device, batch_size=64):
+    """
+    Extrai features em batch para maior eficiência.
+    
+    Args:
+        model: Modelo treinado
+        images: Lista de imagens PIL
+        device: Device (cuda/cpu)
+        batch_size: Tamanho do batch
+    
+    Returns:
+        torch.Tensor: Features de shape (N, 512)
+    """
+    transform = transforms.Compose([
         transforms.Resize((112, 112)),
-        transforms.RandomHorizontalFlip(p=1.0),  # Always flip
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
-
-    # Apply transforms
-    original_image_tensor = original_transform(image).unsqueeze(0).to(device)
-    flipped_image_tensor = flipped_transform(image).unsqueeze(0).to(device)
-
-    # Extract features
-    original_features = model(original_image_tensor)
-    flipped_features = model(flipped_image_tensor)
-
-    # Combine and return features
-    combined_features = torch.cat([original_features, flipped_features], dim=1).squeeze()
-    return combined_features
+    
+    all_features = []
+    num_batches = (len(images) + batch_size - 1) // batch_size
+    
+    print(f"Processing {len(images)} images in {num_batches} batches...")
+    
+    for i in range(0, len(images), batch_size):
+        batch_images = images[i:i + batch_size]
+        
+        # Transformar batch
+        batch_tensors = torch.stack([transform(img) for img in batch_images])
+        batch_tensors = batch_tensors.to(device)
+        
+        # Forward pass do batch
+        with torch.no_grad():
+            features = model(batch_tensors)
+        
+        all_features.append(features)
+    
+    return torch.cat(all_features, dim=0)
 
 
 def compute_metrics_from_predictions(predictions, threshold=0.35):
@@ -125,12 +141,11 @@ def compute_metrics_from_predictions(predictions, threshold=0.35):
         eer = fpr[eer_threshold_idx]
         eer_threshold = thresholds[eer_threshold_idx]
         
-        # Calcular TAR@FAR
+        # ✅ CORREÇÃO: Calcular TAR@FAR (Estado da Arte)
         tar_at_far = {}
         for far_value in [0.001, 0.01, 0.1]:
-            idx = np.where(fpr <= far_value)[0]
-            if len(idx) > 0:
-                tar_at_far[f'TAR@FAR={far_value}'] = tpr[idx[-1]]
+            idx = np.argmin(np.abs(fpr - far_value))  # ✅ Mais próximo
+            tar_at_far[f'TAR@FAR={far_value}'] = tpr[idx]
         
         metrics.update({
             'fpr': fpr,
@@ -249,7 +264,7 @@ def plot_confusion_matrix(predictions, threshold, save_path=None):
 
 def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/lfw/val', 
          compute_full_metrics=False, save_metrics_path=None, threshold=0.35,
-         face_validator=None, no_face_policy='exclude'):
+         face_validator=None, no_face_policy='exclude', batch_size=64):
     """
     Evaluate the model on validation dataset (LFW or CelebA)
     
@@ -262,8 +277,9 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         compute_full_metrics: Se True, calcula métricas completas (ROC, confusion matrix, etc)
         save_metrics_path: Diretório para salvar gráficos de métricas
         threshold: Limiar de similaridade para métricas de classificação
-        face_validator: 🆕 FaceValidator instance for RetinaFace validation (optional)
-        no_face_policy: 🆕 Policy for images without faces ('exclude' or 'include')
+        face_validator: FaceValidator instance for RetinaFace validation (optional)
+        no_face_policy: Policy for images without faces ('exclude' or 'include')
+        batch_size: Batch size for feature extraction (default: 64)
         
     Returns:
         tuple: (mean_similarity, predictions, metrics_dict)
@@ -300,7 +316,7 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
     else:
         raise ValueError(f"Unsupported validation dataset: {val_dataset}. Choose 'lfw' or 'celeba'.")
 
-    # 🆕 FACE VALIDATION: Validate and filter pairs if face_validator is provided
+    # Face validation
     valid_pairs_list = None
     face_validation_stats = {}
     
@@ -337,15 +353,13 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
             print(f"{'='*70}\n")
         
         elif val_dataset == 'celeba':
-            # Similar implementation for CelebA (not fully implemented here)
             print("Warning: Face validation for CelebA not fully implemented yet")
             valid_pairs_list = None
 
     # Process pairs
-    predicts = []
     pairs_to_process = []
     
-    # 🆕 If face validation was performed and pairs were filtered
+    # If face validation was performed and pairs were filtered
     if valid_pairs_list is not None:
         # Use filtered pairs
         for path1, path2, is_same in valid_pairs_list:
@@ -395,21 +409,40 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
             
             pairs_to_process.append((path1, path2, is_same))
     
-    # Extract features for all pairs
-    with torch.no_grad():
-        for path1, path2, is_same in pairs_to_process:
-            try:
-                img1 = Image.open(path1).convert('RGB')
-                img2 = Image.open(path2).convert('RGB')
-            except FileNotFoundError:
-                print(f"Warning: Image not found, skipping pair: {path1} or {path2}")
-                continue
-
-            f1 = extract_deep_features(model, img1, device)
-            f2 = extract_deep_features(model, img2, device)
-
-            distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
-            predicts.append([path1, path2, distance.item(), is_same])
+    # ✅ BATCH PROCESSING OTIMIZADO
+    print(f"Loading {len(pairs_to_process)} image pairs...")
+    
+    # 1. Carregar todas as imagens primeiro
+    all_images = []
+    valid_pairs = []
+    
+    for path1, path2, is_same in pairs_to_process:
+        try:
+            img1 = Image.open(path1).convert('RGB')
+            img2 = Image.open(path2).convert('RGB')
+            all_images.extend([img1, img2])
+            valid_pairs.append((len(all_images)-2, len(all_images)-1, is_same))
+        except FileNotFoundError:
+            print(f"Warning: Image not found, skipping pair: {path1} or {path2}")
+            continue
+    
+    if len(all_images) == 0:
+        print("Warning: No valid images were loaded.")
+        return 0.0, np.array([]), {}
+    
+    print(f"Extracting features for {len(all_images)} images in batches of {batch_size}...")
+    
+    # 2. Extrair features em batch (MUITO MAIS RÁPIDO!)
+    all_features = extract_deep_features_batch(model, all_images, device, batch_size=batch_size)
+    
+    # 3. Calcular similaridades
+    predicts = []
+    for idx1, idx2, is_same in valid_pairs:
+        f1 = all_features[idx1]
+        f2 = all_features[idx2]
+        
+        distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
+        predicts.append(['', '', distance.item(), is_same])
     
     if len(predicts) == 0:
         print("Warning: No valid pairs were processed in the evaluation.")
@@ -432,7 +465,7 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         'median_similarity': np.median(similarities),
     }
     
-    # 🆕 Add face validation statistics to metrics if available
+    # Add face validation statistics to metrics if available
     if face_validation_stats:
         metrics['face_validation_stats'] = face_validation_stats
     
@@ -455,7 +488,7 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
     
     # Print summary
     print(f"\n{'='*50}")
-    print(f"{val_dataset.upper()} - Simplified Evaluation (Positive Pairs Only):")
+    print(f"{val_dataset.upper()} - Evaluation Results:")
     print(f"Mean Similarity: {mean_similarity:.4f} | Standard Deviation: {std_similarity:.4f}")
     
     if compute_full_metrics and 'accuracy' in metrics:
@@ -466,6 +499,13 @@ def eval(model, model_path=None, device=None, val_dataset='lfw', val_root='data/
         print(f"  Recall:    {metrics['recall']:.4f}")
         if 'auc' in metrics:
             print(f"  AUC Score: {metrics['auc']:.4f}")
+
+        if 'TAR@FAR=0.001' in metrics:
+            print(f"  TAR@FAR=0.001: {metrics['TAR@FAR=0.001']:.4f}")
+        if 'TAR@FAR=0.01' in metrics:
+            print(f"  TAR@FAR=0.01:  {metrics['TAR@FAR=0.01']:.4f}")
+        if 'TAR@FAR=0.1' in metrics:
+            print(f"  TAR@FAR=0.1:   {metrics['TAR@FAR=0.1']:.4f}")
         
         if 'confusion_matrix' in metrics:
             cm = metrics['confusion_matrix']
@@ -500,7 +540,8 @@ if __name__ == '__main__':
         val_root='data/lfw/val',
         compute_full_metrics=True,
         save_metrics_path='evaluation_metrics',
-        threshold=0.35
+        threshold=0.35,
+        batch_size=64
     )
     
     print(f"Mean Similarity: {mean_sim:.4f}")
