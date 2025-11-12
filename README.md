@@ -247,7 +247,6 @@ weights/
 - Mean Similarity
 - Accuracy, Precision, Recall, F1-Score
 - AUC, EER (Equal Error Rate)
-- TAR@FAR (0.001, 0.01, 0.1)
 - FAR, FRR
 - Confusion Matrix
 - ROC Curve
